@@ -6,6 +6,8 @@ from typing import Optional
 import typer
 
 from dubshift import __version__
+from dubshift.converters import InvalidAudioPathError, VoiceConversionError, convert_audio
+from dubshift.converters.elevenlabs import ElevenLabsVoiceConverter
 from dubshift.downloader import (
     DEFAULT_DOWNLOAD_DIR,
     DownloadError,
@@ -17,6 +19,8 @@ from dubshift.media import (
     MediaError,
     extract_audio,
 )
+
+SUPPORTED_CONVERSION_PROVIDERS = {"elevenlabs"}
 
 app = typer.Typer(
     name="dubshift",
@@ -76,6 +80,47 @@ def extract(
         raise typer.Exit(code=1) from exc
 
     typer.echo(str(wav_path))
+
+
+@app.command()
+def convert(
+    input_audio: Path = typer.Argument(..., help="Path to the audio file to convert."),
+    provider: str = typer.Option(
+        ...,
+        "--provider",
+        help="Voice-conversion backend to use. Currently only 'elevenlabs' is supported.",
+    ),
+    voice: str = typer.Option(
+        ...,
+        "--voice",
+        help="Backend-specific voice identifier (e.g. an ElevenLabs voice_id).",
+    ),
+    output_path: Path = typer.Option(
+        ...,
+        "--output",
+        "-o",
+        help="Path to write the converted audio to.",
+    ),
+) -> None:
+    """Convert the voice in an audio file using a pluggable voice-conversion provider."""
+    if provider == "elevenlabs":
+        try:
+            converter = ElevenLabsVoiceConverter()
+        except VoiceConversionError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+    else:
+        supported = ", ".join(sorted(SUPPORTED_CONVERSION_PROVIDERS))
+        typer.echo(f"Error: Unknown provider {provider!r}. Supported providers: {supported}.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        result_path = convert_audio(input_audio, output_path, voice, converter)
+    except (InvalidAudioPathError, VoiceConversionError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(str(result_path))
 
 
 if __name__ == "__main__":

@@ -5,6 +5,10 @@ from typer.testing import CliRunner
 
 from dubshift import __version__
 from dubshift.cli import app
+from dubshift.converters.exceptions import (
+    ConversionFailedError,
+    MissingCredentialsError,
+)
 from dubshift.downloader import DownloadError, InvalidURLError
 from dubshift.media import AudioExtractionError, InvalidVideoPathError, MissingFFmpegError
 
@@ -133,3 +137,192 @@ def test_extract_command_reports_extraction_error(monkeypatch: pytest.MonkeyPatc
 
     assert result.exit_code == 1
     assert "corrupt input" in result.output
+
+
+class _FakeElevenLabsConverter:
+    """Stand-in for dubshift.converters.elevenlabs.ElevenLabsVoiceConverter."""
+
+    def __init__(self) -> None:
+        pass
+
+
+def test_convert_command_prints_path_on_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake_output = tmp_path / "converted.mp3"
+
+    def fake_convert_audio(input_path: Path, output_path: Path, voice: str, converter) -> Path:
+        return fake_output
+
+    monkeypatch.setattr("dubshift.cli.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
+    monkeypatch.setattr("dubshift.cli.convert_audio", fake_convert_audio)
+
+    input_audio = tmp_path / "input.wav"
+    input_audio.write_bytes(b"fake pcm audio bytes")
+
+    result = runner.invoke(
+        app,
+        [
+            "convert",
+            str(input_audio),
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "voice-123",
+            "--output",
+            str(fake_output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.output.strip() == str(fake_output)
+
+
+def test_convert_command_passes_voice_and_paths_through_to_orchestration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict = {}
+
+    def fake_convert_audio(input_path: Path, output_path: Path, voice: str, converter) -> Path:
+        captured["input_path"] = input_path
+        captured["output_path"] = output_path
+        captured["voice"] = voice
+        captured["converter"] = converter
+        return output_path
+
+    monkeypatch.setattr("dubshift.cli.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
+    monkeypatch.setattr("dubshift.cli.convert_audio", fake_convert_audio)
+
+    input_audio = tmp_path / "input.wav"
+    input_audio.write_bytes(b"fake pcm audio bytes")
+    output_path = tmp_path / "converted.mp3"
+
+    runner.invoke(
+        app,
+        [
+            "convert",
+            str(input_audio),
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "narrator-1",
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    assert captured["input_path"] == input_audio
+    assert captured["output_path"] == output_path
+    assert captured["voice"] == "narrator-1"
+    assert isinstance(captured["converter"], _FakeElevenLabsConverter)
+
+
+@pytest.mark.parametrize("missing_flag", ["--voice", "--output", "--provider"])
+def test_convert_command_requires_core_options(missing_flag: str, tmp_path: Path) -> None:
+    input_audio = tmp_path / "input.wav"
+    input_audio.write_bytes(b"fake pcm audio bytes")
+
+    all_args = [
+        str(input_audio),
+        "--provider",
+        "elevenlabs",
+        "--voice",
+        "voice-123",
+        "--output",
+        str(tmp_path / "converted.mp3"),
+    ]
+    # Drop the flag under test and its value.
+    flag_index = all_args.index(missing_flag)
+    args = all_args[:flag_index] + all_args[flag_index + 2 :]
+
+    result = runner.invoke(app, ["convert", *args])
+
+    assert result.exit_code != 0
+    assert missing_flag in result.output
+
+
+def test_convert_command_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def fail_if_called() -> None:
+        raise AssertionError("ElevenLabsVoiceConverter should not be constructed for an unknown provider")
+
+    monkeypatch.setattr("dubshift.cli.ElevenLabsVoiceConverter", fail_if_called)
+
+    input_audio = tmp_path / "input.wav"
+    input_audio.write_bytes(b"fake pcm audio bytes")
+
+    result = runner.invoke(
+        app,
+        [
+            "convert",
+            str(input_audio),
+            "--provider",
+            "seedvc",
+            "--voice",
+            "voice-123",
+            "--output",
+            str(tmp_path / "converted.mp3"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Unknown provider" in result.output
+    assert "seedvc" in result.output
+
+
+def test_convert_command_reports_provider_construction_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_elevenlabs_converter() -> None:
+        raise MissingCredentialsError("No ElevenLabs API key provided.")
+
+    monkeypatch.setattr("dubshift.cli.ElevenLabsVoiceConverter", fake_elevenlabs_converter)
+
+    input_audio = tmp_path / "input.wav"
+    input_audio.write_bytes(b"fake pcm audio bytes")
+
+    result = runner.invoke(
+        app,
+        [
+            "convert",
+            str(input_audio),
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "voice-123",
+            "--output",
+            str(tmp_path / "converted.mp3"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "No ElevenLabs API key provided" in result.output
+
+
+def test_convert_command_reports_conversion_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_convert_audio(input_path: Path, output_path: Path, voice: str, converter) -> Path:
+        raise ConversionFailedError("ElevenLabs speech-to-speech request failed (status 500).")
+
+    monkeypatch.setattr("dubshift.cli.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
+    monkeypatch.setattr("dubshift.cli.convert_audio", fake_convert_audio)
+
+    input_audio = tmp_path / "input.wav"
+    input_audio.write_bytes(b"fake pcm audio bytes")
+
+    result = runner.invoke(
+        app,
+        [
+            "convert",
+            str(input_audio),
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "voice-123",
+            "--output",
+            str(tmp_path / "converted.mp3"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "request failed" in result.output
