@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# DubShift: never commit downloaded or generated media
+*.mp4
+*.mkv
+*.webm
+*.wav
+*.mp3
+*.m4a
+/downloads/
+/output/
+
