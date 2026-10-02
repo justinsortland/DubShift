@@ -1,6 +1,7 @@
 """DubShift command-line interface."""
 
 from pathlib import Path
+from typing import Optional
 
 import typer
 
@@ -10,6 +11,11 @@ from dubshift.downloader import (
     DownloadError,
     InvalidURLError,
     download_video,
+)
+from dubshift.media import (
+    InvalidVideoPathError,
+    MediaError,
+    extract_audio,
 )
 
 app = typer.Typer(
@@ -49,6 +55,27 @@ def download(
         raise typer.Exit(code=1) from exc
 
     typer.echo(str(downloaded_path))
+
+
+@app.command()
+def extract(
+    video_path: Path = typer.Argument(..., help="Path to a downloaded video file."),
+    output_path: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Path to write the extracted WAV file to "
+        "(default: alongside the video, same name with a .wav extension).",
+    ),
+) -> None:
+    """Extract a speech-ready WAV audio track from a video file."""
+    try:
+        wav_path = extract_audio(video_path, output_path)
+    except (InvalidVideoPathError, MediaError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(str(wav_path))
 
 
 if __name__ == "__main__":
