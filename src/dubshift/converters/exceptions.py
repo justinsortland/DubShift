@@ -24,3 +24,11 @@ class UnsupportedVoiceError(VoiceConversionError):
 
 class ConversionFailedError(VoiceConversionError):
     """Raised when a converter fails to produce valid output audio."""
+
+
+class MissingCredentialsError(VoiceConversionError):
+    """Raised when a converter requires credentials that were not provided."""
+
+
+class InputDurationLimitExceededError(VoiceConversionError):
+    """Raised when input audio exceeds a provider's maximum supported duration."""

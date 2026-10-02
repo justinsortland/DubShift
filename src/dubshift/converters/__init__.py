@@ -13,7 +13,9 @@ from dubshift.converters.base import VoiceConverter
 from dubshift.converters.exceptions import (
     ConversionFailedError,
     ConversionOutputExistsError,
+    InputDurationLimitExceededError,
     InvalidAudioPathError,
+    MissingCredentialsError,
     UnsupportedVoiceError,
     VoiceConversionError,
 )
@@ -27,6 +29,8 @@ __all__ = [
     "ConversionOutputExistsError",
     "UnsupportedVoiceError",
     "ConversionFailedError",
+    "MissingCredentialsError",
+    "InputDurationLimitExceededError",
     "FakeVoiceConverter",
     "convert_audio",
 ]
