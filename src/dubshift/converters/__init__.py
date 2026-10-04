@@ -10,9 +10,13 @@ implemented elsewhere as separate modules that satisfy the
 """
 
 from dubshift.converters.base import VoiceConverter
+from dubshift.converters.chunking import convert_long_audio
 from dubshift.converters.exceptions import (
+    ChunkDurationMismatchError,
+    ChunkingError,
     ConversionFailedError,
     ConversionOutputExistsError,
+    FinalDurationMismatchError,
     InputDurationLimitExceededError,
     InvalidAudioPathError,
     MissingCredentialsError,
@@ -31,6 +35,10 @@ __all__ = [
     "ConversionFailedError",
     "MissingCredentialsError",
     "InputDurationLimitExceededError",
+    "ChunkingError",
+    "ChunkDurationMismatchError",
+    "FinalDurationMismatchError",
     "FakeVoiceConverter",
     "convert_audio",
+    "convert_long_audio",
 ]

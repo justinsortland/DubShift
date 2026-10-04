@@ -1,3 +1,5 @@
+import builtins
+import importlib
 from pathlib import Path
 
 import pytest
@@ -139,6 +141,36 @@ def test_extract_command_reports_extraction_error(monkeypatch: pytest.MonkeyPatc
     assert "corrupt input" in result.output
 
 
+def test_cli_module_and_unrelated_commands_do_not_require_elevenlabs_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dubshift.cli must not import the ElevenLabs provider (or its SDK) at module load time.
+
+    Simulates the ElevenLabs SDK being completely uninstalled by making any
+    attempt to import it raise ImportError, then reloads dubshift.cli's
+    *existing* module object in place (so this doesn't leave a second,
+    orphaned module object behind for other tests to trip over) and
+    exercises commands unrelated to voice conversion.
+    """
+    import dubshift.cli as cli_module
+
+    real_import = builtins.__import__
+
+    def blocking_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "elevenlabs" or name.startswith("elevenlabs."):
+            raise ImportError("simulated: the elevenlabs SDK is not installed")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", blocking_import)
+    importlib.reload(cli_module)
+
+    fresh_runner = CliRunner()
+
+    assert fresh_runner.invoke(cli_module.app, ["--help"]).exit_code == 0
+    assert fresh_runner.invoke(cli_module.app, ["download", "--help"]).exit_code == 0
+    assert fresh_runner.invoke(cli_module.app, ["extract", "--help"]).exit_code == 0
+
+
 class _FakeElevenLabsConverter:
     """Stand-in for dubshift.converters.elevenlabs.ElevenLabsVoiceConverter."""
 
@@ -154,7 +186,7 @@ def test_convert_command_prints_path_on_success(
     def fake_convert_audio(input_path: Path, output_path: Path, voice: str, converter) -> Path:
         return fake_output
 
-    monkeypatch.setattr("dubshift.cli.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
+    monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
     monkeypatch.setattr("dubshift.cli.convert_audio", fake_convert_audio)
 
     input_audio = tmp_path / "input.wav"
@@ -190,7 +222,7 @@ def test_convert_command_passes_voice_and_paths_through_to_orchestration(
         captured["converter"] = converter
         return output_path
 
-    monkeypatch.setattr("dubshift.cli.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
+    monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
     monkeypatch.setattr("dubshift.cli.convert_audio", fake_convert_audio)
 
     input_audio = tmp_path / "input.wav"
@@ -245,7 +277,7 @@ def test_convert_command_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatc
     def fail_if_called() -> None:
         raise AssertionError("ElevenLabsVoiceConverter should not be constructed for an unknown provider")
 
-    monkeypatch.setattr("dubshift.cli.ElevenLabsVoiceConverter", fail_if_called)
+    monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", fail_if_called)
 
     input_audio = tmp_path / "input.wav"
     input_audio.write_bytes(b"fake pcm audio bytes")
@@ -275,7 +307,7 @@ def test_convert_command_reports_provider_construction_error(
     def fake_elevenlabs_converter() -> None:
         raise MissingCredentialsError("No ElevenLabs API key provided.")
 
-    monkeypatch.setattr("dubshift.cli.ElevenLabsVoiceConverter", fake_elevenlabs_converter)
+    monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", fake_elevenlabs_converter)
 
     input_audio = tmp_path / "input.wav"
     input_audio.write_bytes(b"fake pcm audio bytes")
@@ -304,7 +336,7 @@ def test_convert_command_reports_conversion_error(
     def fake_convert_audio(input_path: Path, output_path: Path, voice: str, converter) -> Path:
         raise ConversionFailedError("ElevenLabs speech-to-speech request failed (status 500).")
 
-    monkeypatch.setattr("dubshift.cli.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
+    monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
     monkeypatch.setattr("dubshift.cli.convert_audio", fake_convert_audio)
 
     input_audio = tmp_path / "input.wav"

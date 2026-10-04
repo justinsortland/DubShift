@@ -32,3 +32,15 @@ class MissingCredentialsError(VoiceConversionError):
 
 class InputDurationLimitExceededError(VoiceConversionError):
     """Raised when input audio exceeds a provider's maximum supported duration."""
+
+
+class ChunkingError(VoiceConversionError):
+    """Raised when splitting input audio into chunks, or reconstructing the final output, fails."""
+
+
+class ChunkDurationMismatchError(VoiceConversionError):
+    """Raised when a converted chunk's duration differs materially from its source chunk's."""
+
+
+class FinalDurationMismatchError(ChunkDurationMismatchError):
+    """Raised when the fully reconstructed output's total duration differs materially from the source's."""

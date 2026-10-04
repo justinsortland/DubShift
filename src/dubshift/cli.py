@@ -7,7 +7,6 @@ import typer
 
 from dubshift import __version__
 from dubshift.converters import InvalidAudioPathError, VoiceConversionError, convert_audio
-from dubshift.converters.elevenlabs import ElevenLabsVoiceConverter
 from dubshift.downloader import (
     DEFAULT_DOWNLOAD_DIR,
     DownloadError,
@@ -104,6 +103,8 @@ def convert(
 ) -> None:
     """Convert the voice in an audio file using a pluggable voice-conversion provider."""
     if provider == "elevenlabs":
+        from dubshift.converters.elevenlabs import ElevenLabsVoiceConverter
+
         try:
             converter = ElevenLabsVoiceConverter()
         except VoiceConversionError as exc:
