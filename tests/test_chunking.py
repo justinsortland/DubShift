@@ -746,11 +746,102 @@ def test_progress_events_for_long_input_report_each_chunk_in_order(
         on_progress=events.append,
     )
 
-    # 700s with target=270/max=295 -> three chunks.
+    # 700s with target=270/max=295 -> three chunks, all fresh (cache
+    # misses, since this test uses an empty isolated cache dir).
     assert events == [
         "Detecting chunk boundaries...",
-        "Converting chunk 1/3...",
-        "Converting chunk 2/3...",
-        "Converting chunk 3/3...",
+        "Chunk 1/3: converting...",
+        "Chunk 2/3: converting...",
+        "Chunk 3/3: converting...",
         "Reconstructing audio...",
     ]
+
+
+def test_chunk_progress_reports_converting_on_cache_miss(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_chunking_pipeline(monkeypatch, total_duration=700.0)
+
+    events: list[str] = []
+    input_audio = _make_input_audio(tmp_path)
+
+    convert_long_audio(
+        input_audio,
+        tmp_path / "output.wav",
+        "voice-1",
+        FakeVoiceConverter(),
+        on_progress=events.append,
+    )
+
+    chunk_events = [e for e in events if e.startswith("Chunk ")]
+    assert chunk_events == [
+        "Chunk 1/3: converting...",
+        "Chunk 2/3: converting...",
+        "Chunk 3/3: converting...",
+    ]
+
+
+def test_chunk_progress_reports_cache_hit_on_second_identical_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_chunking_pipeline(monkeypatch, total_duration=700.0)
+
+    converter = FakeVoiceConverter()
+    input_audio = _make_input_audio(tmp_path)
+
+    # First run: populates the cache for all three chunks.
+    first_events: list[str] = []
+    convert_long_audio(
+        input_audio, tmp_path / "output1.wav", "voice-1", converter, on_progress=first_events.append
+    )
+    assert len(converter.calls) == 3
+
+    # Second, identical run: every chunk must be reported as a cache hit,
+    # and the converter must not be invoked again.
+    second_events: list[str] = []
+    convert_long_audio(
+        input_audio, tmp_path / "output2.wav", "voice-1", converter, on_progress=second_events.append
+    )
+
+    chunk_events = [e for e in second_events if e.startswith("Chunk ")]
+    assert chunk_events == [
+        "Chunk 1/3: cache hit",
+        "Chunk 2/3: cache hit",
+        "Chunk 3/3: cache hit",
+    ]
+    assert len(converter.calls) == 3  # unchanged -- no new provider calls
+
+
+def test_chunk_progress_with_no_cache_always_reports_converting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_chunking_pipeline(monkeypatch, total_duration=700.0)
+
+    converter = FakeVoiceConverter()
+    input_audio = _make_input_audio(tmp_path)
+
+    # Populate the cache first.
+    convert_long_audio(input_audio, tmp_path / "output1.wav", "voice-1", converter)
+    assert len(converter.calls) == 3
+
+    # With use_cache=False (--no-cache), every chunk must report
+    # "converting..." -- never "cache hit" -- and the provider must be
+    # invoked again for all of them.
+    events: list[str] = []
+    convert_long_audio(
+        input_audio,
+        tmp_path / "output2.wav",
+        "voice-1",
+        converter,
+        use_cache=False,
+        on_progress=events.append,
+    )
+
+    chunk_events = [e for e in events if e.startswith("Chunk ")]
+    assert chunk_events == [
+        "Chunk 1/3: converting...",
+        "Chunk 2/3: converting...",
+        "Chunk 3/3: converting...",
+    ]
+    assert not any("cache hit" in e for e in events)
+    assert len(converter.calls) == 6  # 3 from the first run + 3 fresh calls just now

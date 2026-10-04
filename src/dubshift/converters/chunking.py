@@ -361,6 +361,9 @@ def _convert_with_cache(
     voice: str,
     converter: VoiceConverter,
     cache: ConvertedChunkCache | None,
+    *,
+    on_progress: ProgressCallback = noop_progress,
+    label: str | None = None,
 ) -> _CacheableConversion:
     """Run ``convert_audio``, reusing a cached result for identical content when possible.
 
@@ -375,8 +378,18 @@ def _convert_with_cache(
     usual; the caller is responsible for persisting the result to the
     cache -- but only *after* validating it, since a failed, partial, or
     duration-invalid conversion must never be cached.
+
+    If ``label`` is given, reports which of those two things is about to
+    happen through ``on_progress`` -- ``"<label>: cache hit"`` right
+    before copying, or ``"<label>: converting..."`` right before calling
+    the provider (including when caching is disabled, since every call is
+    then effectively a miss) -- so progress output never claims a chunk is
+    "converting" when it was actually served from the cache. If ``label``
+    is ``None``, no such message is emitted here.
     """
     if cache is None:
+        if label is not None:
+            on_progress(f"{label}: converting...")
         convert_audio(source_path, dest_path, voice, converter)
         return _CacheableConversion(was_cache_hit=False, cache_key=None)
 
@@ -385,9 +398,13 @@ def _convert_with_cache(
     )
     cached_path = cache.get(cache_key)
     if cached_path is not None:
+        if label is not None:
+            on_progress(f"{label}: cache hit")
         shutil.copyfile(cached_path, dest_path)
         return _CacheableConversion(was_cache_hit=True, cache_key=cache_key)
 
+    if label is not None:
+        on_progress(f"{label}: converting...")
     convert_audio(source_path, dest_path, voice, converter)
     return _CacheableConversion(was_cache_hit=False, cache_key=cache_key)
 
@@ -446,7 +463,10 @@ def convert_long_audio(
     cache rooted at the on-disk default location is used.
 
     ``on_progress``, if given, is called with short human-readable status
-    strings (e.g. ``"Converting chunk 2/4..."``) as each stage starts.
+    strings as each stage starts. Each chunk reports whether it was
+    actually converted or served from the cache -- ``"Chunk 2/4:
+    converting..."`` on a miss, or ``"Chunk 2/4: cache hit"`` on a hit --
+    rather than unconditionally claiming it's converting.
     """
     input_path = Path(input_path)
     if not input_path.exists() or not input_path.is_file():
@@ -499,14 +519,19 @@ def convert_long_audio(
         decoded_chunk_paths: list[Path] = []
 
         for span in spans:
-            on_progress(f"Converting chunk {span.index + 1}/{len(spans)}...")
             source_chunk_path = tmp_dir / f"source_{span.index:03d}.wav"
             _extract_chunk(input_path, span, source_chunk_path)
             source_chunk_duration = _probe_duration_seconds(source_chunk_path)
 
             converted_chunk_path = tmp_dir / f"converted_{span.index:03d}.chunk"
             result = _convert_with_cache(
-                source_chunk_path, converted_chunk_path, voice, converter, active_cache
+                source_chunk_path,
+                converted_chunk_path,
+                voice,
+                converter,
+                active_cache,
+                on_progress=on_progress,
+                label=f"Chunk {span.index + 1}/{len(spans)}",
             )
             converted_chunk_duration = _probe_duration_seconds(converted_chunk_path)
 
