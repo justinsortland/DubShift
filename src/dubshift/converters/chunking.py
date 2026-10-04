@@ -16,6 +16,7 @@ size limit is a parameter, not a hardcoded assumption.
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -321,6 +322,29 @@ def _concatenate_wavs(wav_paths: list[Path], output_path: Path, *, work_dir: Pat
     _run_ffmpeg(command, context="concatenating converted chunks")
 
 
+def _verify_final_duration(result_path: Path, expected_duration: float, tolerance: float) -> None:
+    """Verify ``result_path``'s duration matches ``expected_duration`` within ``tolerance``.
+
+    Removes ``result_path`` and raises ``FinalDurationMismatchError`` if it
+    doesn't -- DubShift must never publish a result with unexplained drift
+    from the source timeline, whether that result came from a single
+    provider call or from reassembling many chunks. ``result_path`` is
+    typically a not-yet-published temporary file, verified before it is
+    moved into the real output path.
+    """
+    final_duration = _probe_duration_seconds(result_path)
+    final_drift = abs(final_duration - expected_duration)
+    if final_drift > tolerance:
+        result_path.unlink(missing_ok=True)
+        raise FinalDurationMismatchError(
+            f"Reconstructed output duration ({final_duration:.3f}s) differs "
+            f"from the source duration ({expected_duration:.3f}s) by "
+            f"{final_drift:.3f}s, exceeding the {tolerance:.3f}s tolerance. "
+            "Refusing to publish a result with this much drift from the "
+            "source timeline."
+        )
+
+
 def convert_long_audio(
     input_path: Path,
     output_path: Path,
@@ -331,27 +355,35 @@ def convert_long_audio(
     max_chunk_seconds: float = DEFAULT_MAX_CHUNK_SECONDS,
     duration_tolerance_seconds: float = DEFAULT_DURATION_TOLERANCE_SECONDS,
 ) -> Path:
-    """Convert ``input_path`` through ``converter``, splitting it into chunks if needed.
+    """Convert ``input_path`` through ``converter``, always producing DubShift's
+    canonical WAV (PCM signed 16-bit little-endian, 48kHz, mono) at ``output_path``.
 
-    If ``input_path`` is already at or under ``max_chunk_seconds``, this is
-    exactly ``convert_audio(input_path, output_path, voice, converter)`` --
-    no chunking, same output format the converter itself produces.
+    If ``input_path`` is already at or under ``max_chunk_seconds``, the
+    existing fast/single-request path is used -- ``converter`` is invoked
+    exactly once, with no chunk extraction -- but whatever format it
+    returns (e.g. an mp3 from ElevenLabs) is then decoded into the
+    canonical WAV via the same normalization step the chunked path uses,
+    so a caller can always rely on ``output_path`` containing real
+    WAV/PCM data, never provider-native bytes under a ``.wav`` name.
 
     Otherwise, the audio is split into chunks (cut at a silence/low-energy
     pause near each target boundary when one exists, else at the hard
     ``max_chunk_seconds`` limit), each chunk is converted independently
     through ``converter`` via ``convert_audio``, every converted chunk's
     duration is checked against its source chunk's duration within
-    ``duration_tolerance_seconds``, each converted chunk is decoded to a
-    common PCM WAV format, and all chunks are losslessly concatenated, in
-    order, into ``output_path`` as one continuous WAV file. Finally, the
-    complete reconstructed output's total duration is checked against the
-    complete source duration (also within ``duration_tolerance_seconds``)
-    -- catching cumulative drift across chunks that each individually
-    passed their own per-chunk check -- and the output is removed and a
-    ``FinalDurationMismatchError`` raised if that invariant fails. All
-    intermediate chunk files live in a temporary directory that is removed
-    whether this succeeds or raises.
+    ``duration_tolerance_seconds``, each converted chunk is decoded to the
+    same canonical PCM WAV format, and all chunks are losslessly
+    concatenated, in order, into ``output_path`` as one continuous WAV
+    file.
+
+    In both cases, the complete output's total duration is finally
+    checked against the complete source duration (within
+    ``duration_tolerance_seconds``) -- catching drift a provider
+    introduced (for a short input) or that accumulated across chunks that
+    each individually passed their own per-chunk check (for a long one) --
+    and the output is removed and a ``FinalDurationMismatchError`` raised
+    if that invariant fails. All intermediate files live in a temporary
+    directory that is removed whether this succeeds or raises.
     """
     input_path = Path(input_path)
     if not input_path.exists() or not input_path.is_file():
@@ -364,7 +396,20 @@ def convert_long_audio(
     total_duration = _probe_duration_seconds(input_path)
 
     if total_duration <= max_chunk_seconds:
-        return convert_audio(input_path, output_path, voice, converter)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.TemporaryDirectory(prefix="dubshift-convert-") as tmp_dir_name:
+            tmp_dir = Path(tmp_dir_name)
+            provider_output_path = tmp_dir / "provider_output.chunk"
+            convert_audio(input_path, provider_output_path, voice, converter)
+
+            normalized_path = tmp_dir / "normalized.wav"
+            _decode_to_wav(provider_output_path, normalized_path)
+            _verify_final_duration(normalized_path, total_duration, duration_tolerance_seconds)
+
+            shutil.move(str(normalized_path), str(output_path))
+
+        return output_path
 
     silence_intervals = _detect_silence_intervals(input_path, total_duration)
     spans = _choose_chunk_boundaries(
@@ -405,20 +450,10 @@ def convert_long_audio(
             _decode_to_wav(converted_chunk_path, decoded_chunk_path)
             decoded_chunk_paths.append(decoded_chunk_path)
 
-        _concatenate_wavs(decoded_chunk_paths, output_path, work_dir=tmp_dir)
+        reconstructed_path = tmp_dir / "reconstructed.wav"
+        _concatenate_wavs(decoded_chunk_paths, reconstructed_path, work_dir=tmp_dir)
+        _verify_final_duration(reconstructed_path, total_duration, duration_tolerance_seconds)
 
-        final_duration = _probe_duration_seconds(output_path)
-        final_drift = abs(final_duration - total_duration)
-        if final_drift > duration_tolerance_seconds:
-            output_path.unlink(missing_ok=True)
-            raise FinalDurationMismatchError(
-                f"Reconstructed output duration ({final_duration:.3f}s) "
-                f"differs from the source duration ({total_duration:.3f}s) "
-                f"by {final_drift:.3f}s, exceeding the "
-                f"{duration_tolerance_seconds:.3f}s tolerance. Refusing to "
-                "publish a result with this much drift from the source "
-                "timeline, even though each individual chunk was within "
-                "tolerance."
-            )
+        shutil.move(str(reconstructed_path), str(output_path))
 
     return output_path

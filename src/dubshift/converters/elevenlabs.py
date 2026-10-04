@@ -39,6 +39,13 @@ _VOICE_NOT_FOUND_STATUS_CODE = 404
 # different status code for it.
 _VOICE_NOT_FOUND_DETAIL_STATUS = "voice_not_found"
 
+# Fields ElevenLabs may use for a structured error's machine-readable
+# identifier (e.g. "quota_exceeded", "invalid_api_key",
+# "missing_permissions"), in preference order. "status" matches the field
+# already used above for voice_not_found detection; "code" and "type" are
+# included defensively in case a given response uses one of those instead.
+_ERROR_DETAIL_IDENTIFIER_FIELDS = ("status", "code", "type")
+
 # The speech-to-speech model requested for every conversion.
 MODEL_ID = "eleven_multilingual_sts_v2"
 
@@ -121,6 +128,57 @@ def _is_unsupported_voice_error(exc: ApiError) -> bool:
     return isinstance(detail, dict) and detail.get("status") == _VOICE_NOT_FOUND_DETAIL_STATUS
 
 
+def _extract_error_detail(body: object) -> dict | None:
+    """Safely pull ElevenLabs' structured ``detail`` object out of an error body.
+
+    Only ever looks at the already-parsed response *body* ElevenLabs sent
+    back -- never request headers or anything else that could carry
+    credentials. Returns ``None`` (never raises) if the body isn't shaped
+    as expected, so callers can always fall back to a generic message.
+    """
+    if not isinstance(body, dict):
+        return None
+    detail = body.get("detail")
+    if not isinstance(detail, dict):
+        return None
+    return detail
+
+
+def _describe_api_error(exc: ApiError) -> str:
+    """Build a one-line(-plus-detail) description of an ElevenLabs ApiError.
+
+    Tries to surface the structured cause (e.g. ``quota_exceeded``,
+    ``invalid_api_key``, ``missing_permissions``) and human-readable
+    message ElevenLabs included in its response body. Falls back cleanly
+    to the plain status-only message if the body doesn't contain anything
+    usable.
+    """
+    base_message = f"ElevenLabs speech-to-speech request failed (status {exc.status_code})."
+
+    detail = _extract_error_detail(exc.body)
+    if detail is None:
+        return base_message
+
+    identifier = None
+    for field in _ERROR_DETAIL_IDENTIFIER_FIELDS:
+        value = detail.get(field)
+        if isinstance(value, str) and value:
+            identifier = value
+            break
+
+    message = detail.get("message")
+    message = message if isinstance(message, str) and message else None
+
+    if identifier is None and message is None:
+        return base_message
+
+    summary = " — ".join(part for part in (identifier, message) if part)
+    return (
+        f"ElevenLabs speech-to-speech request failed (status {exc.status_code}):\n"
+        f"{summary}"
+    )
+
+
 def _write_output_atomically(data: bytes, output_path: Path) -> None:
     """Write ``data`` to ``output_path`` without ever leaving a partial file there.
 
@@ -190,9 +248,7 @@ class ElevenLabsVoiceConverter:
                     f"ElevenLabs voice {voice!r} was not found or is not "
                     f"available for this account (status {exc.status_code})."
                 ) from exc
-            raise ConversionFailedError(
-                f"ElevenLabs speech-to-speech request failed (status {exc.status_code})."
-            ) from exc
+            raise ConversionFailedError(_describe_api_error(exc)) from exc
         except httpx.HTTPError as exc:
             raise ConversionFailedError(
                 "ElevenLabs speech-to-speech request failed due to a "

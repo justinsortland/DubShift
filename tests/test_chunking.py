@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -9,8 +10,16 @@ from dubshift.converters.chunking import (
     _parse_silencedetect_output,
     convert_long_audio,
 )
-from dubshift.converters.exceptions import ChunkDurationMismatchError, FinalDurationMismatchError
+from dubshift.converters.exceptions import (
+    ChunkDurationMismatchError,
+    ConversionFailedError,
+    FinalDurationMismatchError,
+)
 from dubshift.converters.fake import FakeVoiceConverter
+
+
+def _fail_if_called(*args: object, **kwargs: object) -> None:
+    raise AssertionError("this should not be called")
 
 # ---------------------------------------------------------------------------
 # Pure unit tests: silencedetect output parsing
@@ -178,14 +187,17 @@ def _make_input_audio(tmp_path: Path) -> Path:
     return input_audio
 
 
-def test_short_input_requires_no_chunking(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_short_input_invokes_converter_once_and_skips_chunking(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setattr("dubshift.converters.chunking._probe_duration_seconds", lambda path: 60.0)
+    monkeypatch.setattr("dubshift.converters.chunking._detect_silence_intervals", _fail_if_called)
+    monkeypatch.setattr("dubshift.converters.chunking._extract_chunk", _fail_if_called)
 
-    def fail_if_called(*args: object, **kwargs: object) -> None:
-        raise AssertionError("silence detection should not run when no chunking is needed")
+    def fake_decode_to_wav(input_path: Path, output_path: Path) -> None:
+        output_path.write_bytes(input_path.read_bytes() + b"-wav")
 
-    monkeypatch.setattr("dubshift.converters.chunking._detect_silence_intervals", fail_if_called)
-    monkeypatch.setattr("dubshift.converters.chunking._extract_chunk", fail_if_called)
+    monkeypatch.setattr("dubshift.converters.chunking._decode_to_wav", fake_decode_to_wav)
 
     input_audio = _make_input_audio(tmp_path)
     output_path = tmp_path / "output.wav"
@@ -195,8 +207,134 @@ def test_short_input_requires_no_chunking(monkeypatch: pytest.MonkeyPatch, tmp_p
 
     assert result == output_path
     assert output_path.exists()
+
+    # Invoked exactly once -- no chunk extraction/splitting for a short input.
     assert len(converter.calls) == 1
-    assert converter.calls[0] == (input_audio, "voice-1", output_path)
+    called_input, called_voice, called_output_path = converter.calls[0]
+    assert called_input == input_audio
+    assert called_voice == "voice-1"
+    # The provider's raw output must land in a temp file, never directly
+    # at the caller's output_path (which must end up holding normalized
+    # WAV bytes, not provider-native bytes).
+    assert called_output_path != output_path
+
+
+def test_short_input_normalizes_provider_output_to_canonical_wav(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A short, ElevenLabs-like mp3 response must be decoded, not passed through."""
+    monkeypatch.setattr("dubshift.converters.chunking._probe_duration_seconds", lambda path: 10.0)
+    monkeypatch.setattr("dubshift.converters.chunking._detect_silence_intervals", _fail_if_called)
+    monkeypatch.setattr("dubshift.converters.chunking._extract_chunk", _fail_if_called)
+
+    decode_calls: list[bytes] = []
+
+    def fake_decode_to_wav(input_path: Path, output_path: Path) -> None:
+        # Capture what decoding actually received, before the temp
+        # directory holding it is cleaned up.
+        decode_calls.append(input_path.read_bytes())
+        # Simulate ffmpeg actually transcoding the mp3 bytes into WAV bytes.
+        output_path.write_bytes(b"RIFF....WAVEfmt " + input_path.read_bytes())
+
+    monkeypatch.setattr("dubshift.converters.chunking._decode_to_wav", fake_decode_to_wav)
+
+    class FakeElevenLabsLikeConverter:
+        """Writes mp3-shaped bytes, the way ElevenLabsVoiceConverter does."""
+
+        def convert(self, input_audio: Path, *, voice: str, output_path: Path) -> Path:
+            output_path.write_bytes(b"ID3\x03\x00\x00\x00fake mp3 bytes")
+            return output_path
+
+    input_audio = _make_input_audio(tmp_path)
+    output_path = tmp_path / "converted.wav"
+
+    result = convert_long_audio(input_audio, output_path, "voice-1", FakeElevenLabsLikeConverter())
+
+    assert result == output_path
+    assert len(decode_calls) == 1
+    # The provider's mp3 bytes were the *input* to decoding, not what ended
+    # up written verbatim at output_path.
+    assert decode_calls[0].startswith(b"ID3")
+    assert output_path.read_bytes().startswith(b"RIFF")
+
+
+def test_short_input_duration_validation_still_applies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_probe(path: Path) -> float:
+        if path.name == "normalized.wav":
+            return 20.0  # drastically different from the 10.0s source
+        return 10.0
+
+    monkeypatch.setattr("dubshift.converters.chunking._probe_duration_seconds", fake_probe)
+    monkeypatch.setattr("dubshift.converters.chunking._detect_silence_intervals", _fail_if_called)
+    monkeypatch.setattr("dubshift.converters.chunking._extract_chunk", _fail_if_called)
+
+    def fake_decode_to_wav(input_path: Path, output_path: Path) -> None:
+        output_path.write_bytes(b"fake normalized wav bytes")
+
+    monkeypatch.setattr("dubshift.converters.chunking._decode_to_wav", fake_decode_to_wav)
+
+    input_audio = _make_input_audio(tmp_path)
+    output_path = tmp_path / "output.wav"
+    converter = FakeVoiceConverter()
+
+    with pytest.raises(FinalDurationMismatchError, match="Reconstructed output duration"):
+        convert_long_audio(input_audio, output_path, "voice-1", converter)
+
+    assert not output_path.exists()
+
+
+def test_short_input_failure_leaves_no_partial_output_or_temp_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("dubshift.converters.chunking._probe_duration_seconds", lambda path: 10.0)
+    monkeypatch.setattr("dubshift.converters.chunking._detect_silence_intervals", _fail_if_called)
+    monkeypatch.setattr("dubshift.converters.chunking._extract_chunk", _fail_if_called)
+
+    captured_tmp_dirs: list[Path] = []
+
+    class FailingConverter:
+        def convert(self, input_audio: Path, *, voice: str, output_path: Path) -> Path:
+            captured_tmp_dirs.append(output_path.parent)
+            raise ConversionFailedError("provider exploded")
+
+    input_audio = _make_input_audio(tmp_path)
+    output_path = tmp_path / "output.wav"
+
+    with pytest.raises(ConversionFailedError):
+        convert_long_audio(input_audio, output_path, "voice-1", FailingConverter())
+
+    assert not output_path.exists()
+    assert captured_tmp_dirs, "expected the converter to have been invoked before failing"
+    for tmp_dir in captured_tmp_dirs:
+        assert not tmp_dir.exists()
+
+
+def test_decode_to_wav_uses_canonical_48khz_mono_pcm16_format(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The normalization step's own ffmpeg command must target the canonical format."""
+    from dubshift.converters.chunking import _decode_to_wav
+
+    captured_command: list = []
+
+    def fake_run(command: list, **kwargs: object) -> subprocess.CompletedProcess:
+        captured_command.extend(command)
+        Path(command[-1]).write_bytes(b"fake wav bytes")
+        return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("dubshift.converters.chunking.subprocess.run", fake_run)
+
+    input_path = tmp_path / "provider_output.mp3"
+    input_path.write_bytes(b"fake mp3 bytes")
+    output_path = tmp_path / "normalized.wav"
+
+    _decode_to_wav(input_path, output_path)
+
+    assert captured_command[captured_command.index("-ar") + 1] == "48000"
+    assert captured_command[captured_command.index("-ac") + 1] == "1"
+    assert captured_command[captured_command.index("-c:a") + 1] == "pcm_s16le"
 
 
 def _patch_chunking_pipeline(
@@ -206,7 +344,6 @@ def _patch_chunking_pipeline(
     chunk_durations: dict[int, float] | None = None,
     converted_duration_overrides: dict[int, float] | None = None,
     final_output_duration_override: float | None = None,
-    output_filename: str = "output.wav",
 ) -> dict[str, list]:
     """Patch every ffmpeg-backed helper with simple, file-producing fakes.
 
@@ -229,7 +366,11 @@ def _patch_chunking_pipeline(
             if index in converted_duration_overrides:
                 return converted_duration_overrides[index]
             return chunk_durations.get(index, 90.0)
-        if path.name == output_filename and final_output_duration_override is not None:
+        # "reconstructed.wav" (long/chunked path) and "normalized.wav"
+        # (short path) are the not-yet-published temp files whose
+        # duration is checked against the source before being moved into
+        # the real output_path.
+        if path.name in ("reconstructed.wav", "normalized.wav") and final_output_duration_override is not None:
             return final_output_duration_override
         return total_duration
 

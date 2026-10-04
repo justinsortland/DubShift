@@ -12,7 +12,13 @@ from dubshift.converters.exceptions import (
     MissingCredentialsError,
 )
 from dubshift.downloader import DownloadError, InvalidURLError
-from dubshift.media import AudioExtractionError, InvalidVideoPathError, MissingFFmpegError
+from dubshift.media import (
+    AudioExtractionError,
+    AudioReplacementError,
+    InvalidReplacementAudioPathError,
+    InvalidVideoPathError,
+    MissingFFmpegError,
+)
 
 runner = CliRunner()
 
@@ -358,3 +364,251 @@ def test_convert_command_reports_conversion_error(
 
     assert result.exit_code == 1
     assert "request failed" in result.output
+
+
+def test_remux_command_prints_path_on_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake_output = tmp_path / "dubbed.mp4"
+
+    def fake_replace_audio(video_path: Path, audio_path: Path, output_path: Path) -> Path:
+        return fake_output
+
+    monkeypatch.setattr("dubshift.cli.replace_audio", fake_replace_audio)
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake video bytes")
+    audio = tmp_path / "dub.wav"
+    audio.write_bytes(b"fake audio bytes")
+
+    result = runner.invoke(
+        app, ["remux", str(video), str(audio), "--output", str(fake_output)]
+    )
+
+    assert result.exit_code == 0
+    assert result.output.strip() == str(fake_output)
+
+
+def test_remux_command_reports_invalid_video_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def fake_replace_audio(video_path: Path, audio_path: Path, output_path: Path) -> Path:
+        raise InvalidVideoPathError(f"Video file not found: {video_path}")
+
+    monkeypatch.setattr("dubshift.cli.replace_audio", fake_replace_audio)
+
+    audio = tmp_path / "dub.wav"
+    audio.write_bytes(b"fake audio bytes")
+
+    result = runner.invoke(
+        app, ["remux", "does-not-exist.mp4", str(audio), "--output", str(tmp_path / "out.mp4")]
+    )
+
+    assert result.exit_code == 1
+    assert "Video file not found" in result.output
+
+
+def test_remux_command_reports_invalid_audio_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def fake_replace_audio(video_path: Path, audio_path: Path, output_path: Path) -> Path:
+        raise InvalidReplacementAudioPathError(f"Replacement audio file not found: {audio_path}")
+
+    monkeypatch.setattr("dubshift.cli.replace_audio", fake_replace_audio)
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake video bytes")
+
+    result = runner.invoke(
+        app, ["remux", str(video), "does-not-exist.wav", "--output", str(tmp_path / "out.mp4")]
+    )
+
+    assert result.exit_code == 1
+    assert "Replacement audio file not found" in result.output
+
+
+def test_remux_command_reports_ffmpeg_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def fake_replace_audio(video_path: Path, audio_path: Path, output_path: Path) -> Path:
+        raise AudioReplacementError("FFmpeg failed to replace audio: corrupt input")
+
+    monkeypatch.setattr("dubshift.cli.replace_audio", fake_replace_audio)
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake video bytes")
+    audio = tmp_path / "dub.wav"
+    audio.write_bytes(b"fake audio bytes")
+
+    result = runner.invoke(
+        app, ["remux", str(video), str(audio), "--output", str(tmp_path / "out.mp4")]
+    )
+
+    assert result.exit_code == 1
+    assert "corrupt input" in result.output
+
+
+def test_dub_command_prints_success_message(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    fake_output = tmp_path / "dubbed.mp4"
+
+    def fake_dub_video(url: str, output_path: Path, voice: str, converter) -> Path:
+        return fake_output
+
+    monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
+    monkeypatch.setattr("dubshift.cli.dub_video", fake_dub_video)
+
+    result = runner.invoke(
+        app,
+        [
+            "dub",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "voice-123",
+            "--output",
+            str(fake_output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert str(fake_output) in result.output
+
+
+def test_dub_command_passes_url_voice_output_and_converter_through(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict = {}
+
+    def fake_dub_video(url: str, output_path: Path, voice: str, converter) -> Path:
+        captured["url"] = url
+        captured["output_path"] = output_path
+        captured["voice"] = voice
+        captured["converter"] = converter
+        return output_path
+
+    monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
+    monkeypatch.setattr("dubshift.cli.dub_video", fake_dub_video)
+
+    output_path = tmp_path / "dubbed.mp4"
+
+    runner.invoke(
+        app,
+        [
+            "dub",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "narrator-1",
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    assert captured["url"] == "https://youtu.be/dQw4w9WgXcQ"
+    assert captured["output_path"] == output_path
+    assert captured["voice"] == "narrator-1"
+    assert isinstance(captured["converter"], _FakeElevenLabsConverter)
+
+
+def test_dub_command_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def fail_if_called() -> None:
+        raise AssertionError("ElevenLabsVoiceConverter should not be constructed for an unknown provider")
+
+    monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", fail_if_called)
+
+    result = runner.invoke(
+        app,
+        [
+            "dub",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "--provider",
+            "seedvc",
+            "--voice",
+            "voice-123",
+            "--output",
+            str(tmp_path / "dubbed.mp4"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Unknown provider" in result.output
+    assert "seedvc" in result.output
+
+
+def test_dub_command_reports_provider_construction_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_elevenlabs_converter() -> None:
+        raise MissingCredentialsError("No ElevenLabs API key provided.")
+
+    monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", fake_elevenlabs_converter)
+
+    result = runner.invoke(
+        app,
+        [
+            "dub",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "voice-123",
+            "--output",
+            str(tmp_path / "dubbed.mp4"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "No ElevenLabs API key provided" in result.output
+
+
+def test_dub_command_never_prints_the_configured_api_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Even when a real-looking key is configured, failures must never echo it."""
+    secret_key = "sk_test_totally_secret_value_12345"
+    monkeypatch.setenv("ELEVENLABS_API_KEY", secret_key)
+
+    def fake_dub_video(url: str, output_path: Path, voice: str, converter) -> Path:
+        raise DownloadError("Failed to download: video unavailable")
+
+    # Use the real ElevenLabsVoiceConverter so it actually reads the env
+    # var above; only the pipeline call itself is faked.
+    monkeypatch.setattr("dubshift.cli.dub_video", fake_dub_video)
+
+    result = runner.invoke(
+        app,
+        [
+            "dub",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "voice-123",
+            "--output",
+            str(tmp_path / "dubbed.mp4"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert secret_key not in result.output
+
+
+def test_dub_command_reports_pipeline_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def fake_dub_video(url: str, output_path: Path, voice: str, converter) -> Path:
+        raise DownloadError("Failed to download: video unavailable")
+
+    monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
+    monkeypatch.setattr("dubshift.cli.dub_video", fake_dub_video)
+
+    result = runner.invoke(
+        app,
+        [
+            "dub",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "voice-123",
+            "--output",
+            str(tmp_path / "dubbed.mp4"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "video unavailable" in result.output

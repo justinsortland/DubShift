@@ -14,10 +14,13 @@ from dubshift.downloader import (
     download_video,
 )
 from dubshift.media import (
+    InvalidReplacementAudioPathError,
     InvalidVideoPathError,
     MediaError,
     extract_audio,
+    replace_audio,
 )
+from dubshift.pipeline import PipelineError, dub_video
 
 SUPPORTED_CONVERSION_PROVIDERS = {"elevenlabs"}
 
@@ -122,6 +125,86 @@ def convert(
         raise typer.Exit(code=1) from exc
 
     typer.echo(str(result_path))
+
+
+@app.command()
+def remux(
+    video_path: Path = typer.Argument(..., help="Path to the source video file."),
+    audio_path: Path = typer.Argument(..., help="Path to the replacement audio file."),
+    output_path: Path = typer.Option(
+        ...,
+        "--output",
+        "-o",
+        help="Path to write the remuxed MP4 to.",
+    ),
+) -> None:
+    """Replace a video's audio track with another audio file.
+
+    This exists to directly test the remux primitive; it is not yet part
+    of a full download/extract/convert/remux pipeline command.
+    """
+    try:
+        result_path = replace_audio(video_path, audio_path, output_path)
+    except (InvalidVideoPathError, InvalidReplacementAudioPathError, MediaError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(str(result_path))
+
+
+@app.command()
+def dub(
+    url: str = typer.Argument(..., help="YouTube video URL to dub."),
+    provider: str = typer.Option(
+        ...,
+        "--provider",
+        help="Voice-conversion backend to use. Currently only 'elevenlabs' is supported.",
+    ),
+    voice: str = typer.Option(
+        ...,
+        "--voice",
+        help="Backend-specific voice identifier (e.g. an ElevenLabs voice_id).",
+    ),
+    output_path: Path = typer.Option(
+        ...,
+        "--output",
+        "-o",
+        help="Path to write the final dubbed MP4 to.",
+    ),
+) -> None:
+    """Download a YouTube video, convert its spoken voice, and remux the result into one MP4.
+
+    Runs the full download -> extract -> convert -> remux pipeline.
+    """
+    if provider == "elevenlabs":
+        from dubshift.converters.elevenlabs import ElevenLabsVoiceConverter
+
+        try:
+            converter = ElevenLabsVoiceConverter()
+        except VoiceConversionError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+    else:
+        supported = ", ".join(sorted(SUPPORTED_CONVERSION_PROVIDERS))
+        typer.echo(f"Error: Unknown provider {provider!r}. Supported providers: {supported}.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        result_path = dub_video(url, output_path, voice, converter)
+    except (
+        PipelineError,
+        InvalidURLError,
+        DownloadError,
+        InvalidVideoPathError,
+        InvalidReplacementAudioPathError,
+        MediaError,
+        InvalidAudioPathError,
+        VoiceConversionError,
+    ) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Dubbed video written to {result_path}")
 
 
 if __name__ == "__main__":
