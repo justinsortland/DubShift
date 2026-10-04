@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 
@@ -20,6 +21,19 @@ from dubshift.converters.fake import FakeVoiceConverter
 
 def _fail_if_called(*args: object, **kwargs: object) -> None:
     raise AssertionError("this should not be called")
+
+
+@pytest.fixture(autouse=True)
+def isolated_cache_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Point the on-disk converted-chunk cache at a fresh directory for every test.
+
+    Without this, convert_long_audio()'s default cache would read/write
+    the real ~/.cache/dubshift directory, leaking state between test runs
+    (and even between tests in the same run, since many tests reuse the
+    exact same fake input bytes/voice/converter).
+    """
+    monkeypatch.setenv("DUBSHIFT_CACHE_DIR", str(tmp_path / "_cache"))
+
 
 # ---------------------------------------------------------------------------
 # Pure unit tests: silencedetect output parsing
@@ -576,3 +590,167 @@ def test_temp_chunk_files_are_cleaned_up_on_failure(
     for tmp_dir in captured_tmp_dirs:
         assert not tmp_dir.exists()
     assert not output_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Persistent converted-chunk cache (short/single-request path)
+# ---------------------------------------------------------------------------
+
+
+def _mock_short_path_ffmpeg_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Short-path convert_long_audio only touches _probe_duration_seconds and
+    _decode_to_wav; mock those, and forbid the chunking-only helpers."""
+    monkeypatch.setattr("dubshift.converters.chunking._probe_duration_seconds", lambda path: 10.0)
+    monkeypatch.setattr("dubshift.converters.chunking._detect_silence_intervals", _fail_if_called)
+    monkeypatch.setattr("dubshift.converters.chunking._extract_chunk", _fail_if_called)
+    monkeypatch.setattr(
+        "dubshift.converters.chunking._decode_to_wav",
+        lambda input_path, output_path: output_path.write_bytes(input_path.read_bytes() + b"-wav"),
+    )
+
+
+def test_first_run_is_cache_miss_and_invokes_converter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _mock_short_path_ffmpeg_helpers(monkeypatch)
+
+    input_audio = _make_input_audio(tmp_path)
+    converter = FakeVoiceConverter()
+
+    convert_long_audio(input_audio, tmp_path / "output.wav", "voice-1", converter)
+
+    assert len(converter.calls) == 1
+
+
+def test_second_identical_run_is_cache_hit_and_skips_converter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _mock_short_path_ffmpeg_helpers(monkeypatch)
+
+    input_audio = _make_input_audio(tmp_path)
+    converter = FakeVoiceConverter()
+
+    convert_long_audio(input_audio, tmp_path / "output1.wav", "voice-1", converter)
+    assert len(converter.calls) == 1
+
+    convert_long_audio(input_audio, tmp_path / "output2.wav", "voice-1", converter)
+
+    # Still just the one call from the first run -- the second run hit the cache.
+    assert len(converter.calls) == 1
+
+
+def test_failed_conversion_is_never_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("dubshift.converters.chunking._probe_duration_seconds", lambda path: 10.0)
+    monkeypatch.setattr("dubshift.converters.chunking._detect_silence_intervals", _fail_if_called)
+    monkeypatch.setattr("dubshift.converters.chunking._extract_chunk", _fail_if_called)
+
+    class _FailingConverter:
+        def convert(self, input_audio: Path, *, voice: str, output_path: Path) -> Path:
+            raise ConversionFailedError("provider exploded")
+
+    input_audio = _make_input_audio(tmp_path)
+
+    with pytest.raises(ConversionFailedError):
+        convert_long_audio(input_audio, tmp_path / "output.wav", "voice-1", _FailingConverter())
+
+    cache_dir = Path(os.environ["DUBSHIFT_CACHE_DIR"])
+    assert not cache_dir.exists() or list(cache_dir.iterdir()) == []
+
+
+def test_duration_invalid_conversion_is_never_cached(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_probe(path: Path) -> float:
+        if path.name == "normalized.wav":
+            return 999.0  # drastically different -> fails the final duration check
+        return 10.0
+
+    monkeypatch.setattr("dubshift.converters.chunking._probe_duration_seconds", fake_probe)
+    monkeypatch.setattr("dubshift.converters.chunking._detect_silence_intervals", _fail_if_called)
+    monkeypatch.setattr("dubshift.converters.chunking._extract_chunk", _fail_if_called)
+    monkeypatch.setattr(
+        "dubshift.converters.chunking._decode_to_wav",
+        lambda input_path, output_path: output_path.write_bytes(b"normalized wav bytes"),
+    )
+
+    input_audio = _make_input_audio(tmp_path)
+    converter = FakeVoiceConverter()
+
+    with pytest.raises(FinalDurationMismatchError):
+        convert_long_audio(input_audio, tmp_path / "output.wav", "voice-1", converter)
+
+    # The provider call succeeded, but since the result failed validation,
+    # nothing should have been written to the cache.
+    assert len(converter.calls) == 1
+    cache_dir = Path(os.environ["DUBSHIFT_CACHE_DIR"])
+    assert not cache_dir.exists() or list(cache_dir.iterdir()) == []
+
+
+def test_use_cache_false_forces_conversion_even_with_existing_cache_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _mock_short_path_ffmpeg_helpers(monkeypatch)
+
+    input_audio = _make_input_audio(tmp_path)
+    converter = FakeVoiceConverter()
+
+    convert_long_audio(input_audio, tmp_path / "output1.wav", "voice-1", converter)
+    assert len(converter.calls) == 1
+
+    convert_long_audio(
+        input_audio, tmp_path / "output2.wav", "voice-1", converter, use_cache=False
+    )
+
+    # --no-cache must force a fresh provider call even though a matching
+    # cache entry exists from the first run.
+    assert len(converter.calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Progress reporting
+# ---------------------------------------------------------------------------
+
+
+def test_progress_events_for_short_input_are_in_sensible_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _mock_short_path_ffmpeg_helpers(monkeypatch)
+
+    events: list[str] = []
+    input_audio = _make_input_audio(tmp_path)
+
+    convert_long_audio(
+        input_audio,
+        tmp_path / "output.wav",
+        "voice-1",
+        FakeVoiceConverter(),
+        on_progress=events.append,
+    )
+
+    assert events == ["Converting audio..."]
+
+
+def test_progress_events_for_long_input_report_each_chunk_in_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_chunking_pipeline(monkeypatch, total_duration=700.0)
+
+    events: list[str] = []
+    input_audio = _make_input_audio(tmp_path)
+
+    convert_long_audio(
+        input_audio,
+        tmp_path / "output.wav",
+        "voice-1",
+        FakeVoiceConverter(),
+        on_progress=events.append,
+    )
+
+    # 700s with target=270/max=295 -> three chunks.
+    assert events == [
+        "Detecting chunk boundaries...",
+        "Converting chunk 1/3...",
+        "Converting chunk 2/3...",
+        "Converting chunk 3/3...",
+        "Reconstructing audio...",
+    ]

@@ -538,3 +538,17 @@ def test_accepts_input_exactly_at_duration_limit(
     result = converter.convert(input_audio, voice="voice-123", output_path=output_path)
 
     assert result == output_path
+
+
+def test_cache_identity_encodes_model_and_output_format_but_never_the_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabs", _FakeElevenLabsClient)
+
+    secret_key = "sk_test_totally_secret_value_12345"
+    converter = ElevenLabsVoiceConverter(api_key=secret_key)
+
+    identity = converter.cache_identity
+
+    assert identity == f"elevenlabs:{MODEL_ID}:{OUTPUT_FORMAT}"
+    assert secret_key not in identity

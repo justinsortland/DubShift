@@ -22,6 +22,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from dubshift.cache import ConvertedChunkCache, compute_cache_key, provider_identity_for
 from dubshift.converters.base import VoiceConverter
 from dubshift.converters.exceptions import (
     ChunkDurationMismatchError,
@@ -32,6 +33,7 @@ from dubshift.converters.exceptions import (
 )
 from dubshift.converters.orchestration import convert_audio
 from dubshift.media import DEFAULT_CHANNELS, DEFAULT_SAMPLE_RATE
+from dubshift.progress import ProgressCallback, noop_progress
 
 # Target length for each chunk: comfortably under the 5-minute provider
 # limit so that a handful of seconds of boundary slack (searching for a
@@ -345,6 +347,51 @@ def _verify_final_duration(result_path: Path, expected_duration: float, toleranc
         )
 
 
+@dataclass(frozen=True)
+class _CacheableConversion:
+    """The outcome of converting one unit (a chunk, or a whole short input)."""
+
+    was_cache_hit: bool
+    cache_key: str | None
+
+
+def _convert_with_cache(
+    source_path: Path,
+    dest_path: Path,
+    voice: str,
+    converter: VoiceConverter,
+    cache: ConvertedChunkCache | None,
+) -> _CacheableConversion:
+    """Run ``convert_audio``, reusing a cached result for identical content when possible.
+
+    If ``cache`` is ``None``, caching is disabled entirely: always calls
+    the provider, never reads or writes the cache (this is what
+    ``use_cache=False`` / ``--no-cache`` resolves to).
+
+    Otherwise, computes a content-addressed key from ``source_path``'s
+    exact bytes plus ``voice`` and the converter's identity (see
+    ``dubshift.cache``). On a hit, copies the cached bytes to ``dest_path``
+    and skips the provider call entirely. On a miss, calls the provider as
+    usual; the caller is responsible for persisting the result to the
+    cache -- but only *after* validating it, since a failed, partial, or
+    duration-invalid conversion must never be cached.
+    """
+    if cache is None:
+        convert_audio(source_path, dest_path, voice, converter)
+        return _CacheableConversion(was_cache_hit=False, cache_key=None)
+
+    cache_key = compute_cache_key(
+        source_path, voice=voice, provider_identity=provider_identity_for(converter)
+    )
+    cached_path = cache.get(cache_key)
+    if cached_path is not None:
+        shutil.copyfile(cached_path, dest_path)
+        return _CacheableConversion(was_cache_hit=True, cache_key=cache_key)
+
+    convert_audio(source_path, dest_path, voice, converter)
+    return _CacheableConversion(was_cache_hit=False, cache_key=cache_key)
+
+
 def convert_long_audio(
     input_path: Path,
     output_path: Path,
@@ -354,6 +401,9 @@ def convert_long_audio(
     target_chunk_seconds: float = DEFAULT_TARGET_CHUNK_SECONDS,
     max_chunk_seconds: float = DEFAULT_MAX_CHUNK_SECONDS,
     duration_tolerance_seconds: float = DEFAULT_DURATION_TOLERANCE_SECONDS,
+    on_progress: ProgressCallback = noop_progress,
+    use_cache: bool = True,
+    cache: ConvertedChunkCache | None = None,
 ) -> Path:
     """Convert ``input_path`` through ``converter``, always producing DubShift's
     canonical WAV (PCM signed 16-bit little-endian, 48kHz, mono) at ``output_path``.
@@ -384,6 +434,19 @@ def convert_long_audio(
     and the output is removed and a ``FinalDurationMismatchError`` raised
     if that invariant fails. All intermediate files live in a temporary
     directory that is removed whether this succeeds or raises.
+
+    Unless ``use_cache`` is ``False``, each unit converted through the
+    provider (the whole input for a short file, or each chunk for a long
+    one) is looked up in a persistent, content-addressed cache first --
+    see ``dubshift.cache`` -- and skipped entirely on a hit. A fresh
+    conversion is only written to the cache *after* it passes its
+    duration check, so a failed, partial, or duration-invalid result is
+    never cached. ``cache`` lets a caller supply a specific
+    ``ConvertedChunkCache`` instance (mainly for testing); by default a
+    cache rooted at the on-disk default location is used.
+
+    ``on_progress``, if given, is called with short human-readable status
+    strings (e.g. ``"Converting chunk 2/4..."``) as each stage starts.
     """
     input_path = Path(input_path)
     if not input_path.exists() or not input_path.is_file():
@@ -393,24 +456,33 @@ def convert_long_audio(
     if output_path.exists():
         raise ConversionOutputExistsError(f"Refusing to overwrite existing file: {output_path}")
 
+    active_cache = (cache if cache is not None else ConvertedChunkCache()) if use_cache else None
+
     total_duration = _probe_duration_seconds(input_path)
 
     if total_duration <= max_chunk_seconds:
+        on_progress("Converting audio...")
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         with tempfile.TemporaryDirectory(prefix="dubshift-convert-") as tmp_dir_name:
             tmp_dir = Path(tmp_dir_name)
             provider_output_path = tmp_dir / "provider_output.chunk"
-            convert_audio(input_path, provider_output_path, voice, converter)
+            result = _convert_with_cache(
+                input_path, provider_output_path, voice, converter, active_cache
+            )
 
             normalized_path = tmp_dir / "normalized.wav"
             _decode_to_wav(provider_output_path, normalized_path)
             _verify_final_duration(normalized_path, total_duration, duration_tolerance_seconds)
 
+            if not result.was_cache_hit and result.cache_key is not None:
+                active_cache.put(result.cache_key, provider_output_path)
+
             shutil.move(str(normalized_path), str(output_path))
 
         return output_path
 
+    on_progress("Detecting chunk boundaries...")
     silence_intervals = _detect_silence_intervals(input_path, total_duration)
     spans = _choose_chunk_boundaries(
         total_duration,
@@ -427,12 +499,15 @@ def convert_long_audio(
         decoded_chunk_paths: list[Path] = []
 
         for span in spans:
+            on_progress(f"Converting chunk {span.index + 1}/{len(spans)}...")
             source_chunk_path = tmp_dir / f"source_{span.index:03d}.wav"
             _extract_chunk(input_path, span, source_chunk_path)
             source_chunk_duration = _probe_duration_seconds(source_chunk_path)
 
             converted_chunk_path = tmp_dir / f"converted_{span.index:03d}.chunk"
-            convert_audio(source_chunk_path, converted_chunk_path, voice, converter)
+            result = _convert_with_cache(
+                source_chunk_path, converted_chunk_path, voice, converter, active_cache
+            )
             converted_chunk_duration = _probe_duration_seconds(converted_chunk_path)
 
             drift = abs(converted_chunk_duration - source_chunk_duration)
@@ -446,10 +521,14 @@ def convert_long_audio(
                     "cumulative audio/video drift."
                 )
 
+            if not result.was_cache_hit and result.cache_key is not None:
+                active_cache.put(result.cache_key, converted_chunk_path)
+
             decoded_chunk_path = tmp_dir / f"decoded_{span.index:03d}.wav"
             _decode_to_wav(converted_chunk_path, decoded_chunk_path)
             decoded_chunk_paths.append(decoded_chunk_path)
 
+        on_progress("Reconstructing audio...")
         reconstructed_path = tmp_dir / "reconstructed.wav"
         _concatenate_wavs(decoded_chunk_paths, reconstructed_path, work_dir=tmp_dir)
         _verify_final_duration(reconstructed_path, total_duration, duration_tolerance_seconds)

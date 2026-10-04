@@ -6,6 +6,7 @@ from typing import Optional
 import typer
 
 from dubshift import __version__
+from dubshift.cache import ConvertedChunkCache
 from dubshift.converters import InvalidAudioPathError, VoiceConversionError, convert_audio
 from dubshift.downloader import (
     DEFAULT_DOWNLOAD_DIR,
@@ -171,10 +172,17 @@ def dub(
         "-o",
         help="Path to write the final dubbed MP4 to.",
     ),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help="Bypass the converted-chunk cache: always call the provider, "
+        "never read or write cached results.",
+    ),
 ) -> None:
     """Download a YouTube video, convert its spoken voice, and remux the result into one MP4.
 
-    Runs the full download -> extract -> convert -> remux pipeline.
+    Runs the full download -> extract -> convert -> remux pipeline,
+    printing progress as each stage starts.
     """
     if provider == "elevenlabs":
         from dubshift.converters.elevenlabs import ElevenLabsVoiceConverter
@@ -190,7 +198,14 @@ def dub(
         raise typer.Exit(code=1)
 
     try:
-        result_path = dub_video(url, output_path, voice, converter)
+        result_path = dub_video(
+            url,
+            output_path,
+            voice,
+            converter,
+            on_progress=typer.echo,
+            use_cache=not no_cache,
+        )
     except (
         PipelineError,
         InvalidURLError,
@@ -204,7 +219,20 @@ def dub(
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
-    typer.echo(f"Dubbed video written to {result_path}")
+    typer.echo(f"Done: {result_path}")
+
+
+cache_app = typer.Typer(help="Inspect or manage DubShift's converted-chunk cache.")
+app.add_typer(cache_app, name="cache")
+
+
+@cache_app.command("clear")
+def cache_clear() -> None:
+    """Delete all cached converted-chunk results."""
+    cache = ConvertedChunkCache()
+    removed = cache.clear()
+    noun = "entry" if removed == 1 else "entries"
+    typer.echo(f"Removed {removed} cached {noun} from {cache.cache_dir}")
 
 
 if __name__ == "__main__":

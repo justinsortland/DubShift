@@ -212,6 +212,16 @@ class ElevenLabsVoiceConverter:
             )
         self._client = ElevenLabs(api_key=resolved_key)
 
+    @property
+    def cache_identity(self) -> str:
+        """A stable identity for the converted-chunk cache: provider + model + settings.
+
+        Never includes the API key -- only the (non-secret) model and
+        output-format identifiers that actually affect the converted
+        result.
+        """
+        return f"elevenlabs:{MODEL_ID}:{OUTPUT_FORMAT}"
+
     def convert(
         self,
         input_audio: Path,

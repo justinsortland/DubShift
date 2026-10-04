@@ -17,6 +17,7 @@ from pathlib import Path
 from dubshift.converters import VoiceConverter, convert_long_audio
 from dubshift.downloader import download_video
 from dubshift.media import extract_audio, replace_audio
+from dubshift.progress import ProgressCallback, noop_progress
 
 
 class PipelineError(RuntimeError):
@@ -38,6 +39,9 @@ def dub_video(
     output_path: Path,
     voice: str,
     converter: VoiceConverter,
+    *,
+    on_progress: ProgressCallback = noop_progress,
+    use_cache: bool = True,
 ) -> Path:
     """Download ``url``, convert its spoken voice to ``voice``, and remux the result.
 
@@ -54,6 +58,13 @@ def dub_video(
     ``output_path`` is checked up front, before any network or provider
     call: an existing file there is left completely untouched and this
     raises ``PipelineOutputExistsError`` immediately.
+
+    ``on_progress``, if given, is called with short human-readable status
+    strings (e.g. ``"Downloading video..."``) as each stage starts;
+    ``convert_long_audio``'s own finer-grained progress (chunk-by-chunk)
+    is reported through the same callback. ``use_cache`` is forwarded to
+    ``convert_long_audio`` -- set it to ``False`` to bypass the
+    converted-chunk cache entirely (``--no-cache``).
     """
     output_path = Path(output_path)
     if output_path.exists():
@@ -66,11 +77,22 @@ def dub_video(
     with tempfile.TemporaryDirectory(prefix="dubshift-dub-") as tmp_dir_name:
         tmp_dir = Path(tmp_dir_name)
 
+        on_progress("Downloading video...")
         video_path = download_video(url, tmp_dir / "download")
+
+        on_progress("Extracting audio...")
         source_audio_path = extract_audio(video_path, tmp_dir / "source.wav")
+
         converted_audio_path = convert_long_audio(
-            source_audio_path, tmp_dir / "converted.wav", voice, converter
+            source_audio_path,
+            tmp_dir / "converted.wav",
+            voice,
+            converter,
+            on_progress=on_progress,
+            use_cache=use_cache,
         )
+
+        on_progress("Remuxing video...")
         replace_audio(video_path, converted_audio_path, output_path)
 
     return output_path

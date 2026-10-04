@@ -445,7 +445,7 @@ def test_remux_command_reports_ffmpeg_failure(monkeypatch: pytest.MonkeyPatch, t
 def test_dub_command_prints_success_message(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     fake_output = tmp_path / "dubbed.mp4"
 
-    def fake_dub_video(url: str, output_path: Path, voice: str, converter) -> Path:
+    def fake_dub_video(url: str, output_path: Path, voice: str, converter, **kwargs) -> Path:
         return fake_output
 
     monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
@@ -474,11 +474,15 @@ def test_dub_command_passes_url_voice_output_and_converter_through(
 ) -> None:
     captured: dict = {}
 
-    def fake_dub_video(url: str, output_path: Path, voice: str, converter) -> Path:
+    def fake_dub_video(
+        url: str, output_path: Path, voice: str, converter, *, on_progress=None, use_cache: bool = True
+    ) -> Path:
         captured["url"] = url
         captured["output_path"] = output_path
         captured["voice"] = voice
         captured["converter"] = converter
+        captured["on_progress"] = on_progress
+        captured["use_cache"] = use_cache
         return output_path
 
     monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
@@ -504,6 +508,8 @@ def test_dub_command_passes_url_voice_output_and_converter_through(
     assert captured["output_path"] == output_path
     assert captured["voice"] == "narrator-1"
     assert isinstance(captured["converter"], _FakeElevenLabsConverter)
+    assert callable(captured["on_progress"])
+    assert captured["use_cache"] is True
 
 
 def test_dub_command_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -564,7 +570,7 @@ def test_dub_command_never_prints_the_configured_api_key(
     secret_key = "sk_test_totally_secret_value_12345"
     monkeypatch.setenv("ELEVENLABS_API_KEY", secret_key)
 
-    def fake_dub_video(url: str, output_path: Path, voice: str, converter) -> Path:
+    def fake_dub_video(url: str, output_path: Path, voice: str, converter, **kwargs) -> Path:
         raise DownloadError("Failed to download: video unavailable")
 
     # Use the real ElevenLabsVoiceConverter so it actually reads the env
@@ -589,8 +595,143 @@ def test_dub_command_never_prints_the_configured_api_key(
     assert secret_key not in result.output
 
 
+def test_dub_command_reports_progress_messages(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    fake_output = tmp_path / "dubbed.mp4"
+
+    def fake_dub_video(
+        url: str, output_path: Path, voice: str, converter, *, on_progress=None, use_cache: bool = True
+    ) -> Path:
+        on_progress("Downloading video...")
+        on_progress("Extracting audio...")
+        on_progress("Converting audio...")
+        on_progress("Remuxing video...")
+        return fake_output
+
+    monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
+    monkeypatch.setattr("dubshift.cli.dub_video", fake_dub_video)
+
+    result = runner.invoke(
+        app,
+        [
+            "dub",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "voice-123",
+            "--output",
+            str(fake_output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    lines = result.output.strip().splitlines()
+    assert lines == [
+        "Downloading video...",
+        "Extracting audio...",
+        "Converting audio...",
+        "Remuxing video...",
+        f"Done: {fake_output}",
+    ]
+
+
+def test_dub_command_no_cache_flag_disables_caching(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict = {}
+
+    def fake_dub_video(
+        url: str, output_path: Path, voice: str, converter, *, on_progress=None, use_cache: bool = True
+    ) -> Path:
+        captured["use_cache"] = use_cache
+        return output_path
+
+    monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
+    monkeypatch.setattr("dubshift.cli.dub_video", fake_dub_video)
+
+    output_path = tmp_path / "dubbed.mp4"
+
+    runner.invoke(
+        app,
+        [
+            "dub",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "voice-123",
+            "--output",
+            str(output_path),
+            "--no-cache",
+        ],
+    )
+
+    assert captured["use_cache"] is False
+
+
+def test_dub_command_without_no_cache_flag_leaves_caching_enabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict = {}
+
+    def fake_dub_video(
+        url: str, output_path: Path, voice: str, converter, *, on_progress=None, use_cache: bool = True
+    ) -> Path:
+        captured["use_cache"] = use_cache
+        return output_path
+
+    monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)
+    monkeypatch.setattr("dubshift.cli.dub_video", fake_dub_video)
+
+    output_path = tmp_path / "dubbed.mp4"
+
+    runner.invoke(
+        app,
+        [
+            "dub",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "--provider",
+            "elevenlabs",
+            "--voice",
+            "voice-123",
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    assert captured["use_cache"] is True
+
+
+def test_cache_clear_command_reports_removed_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DUBSHIFT_CACHE_DIR", str(tmp_path / "cache"))
+
+    from dubshift.cache import ConvertedChunkCache
+
+    cache = ConvertedChunkCache()
+    source = tmp_path / "converted.mp3"
+    source.write_bytes(b"converted audio bytes")
+    cache.put("some-key", source)
+
+    result = runner.invoke(app, ["cache", "clear"])
+
+    assert result.exit_code == 0
+    assert "Removed 1 cached entry" in result.output
+    assert cache.get("some-key") is None
+
+
+def test_cache_clear_command_on_empty_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DUBSHIFT_CACHE_DIR", str(tmp_path / "cache"))
+
+    result = runner.invoke(app, ["cache", "clear"])
+
+    assert result.exit_code == 0
+    assert "Removed 0 cached entries" in result.output
+
+
 def test_dub_command_reports_pipeline_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    def fake_dub_video(url: str, output_path: Path, voice: str, converter) -> Path:
+    def fake_dub_video(url: str, output_path: Path, voice: str, converter, **kwargs) -> Path:
         raise DownloadError("Failed to download: video unavailable")
 
     monkeypatch.setattr("dubshift.converters.elevenlabs.ElevenLabsVoiceConverter", _FakeElevenLabsConverter)

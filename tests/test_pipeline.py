@@ -55,12 +55,24 @@ def _install_stage_fakes(
         output_path.write_bytes(b"fake source wav bytes")
         return output_path
 
-    def fake_convert_long_audio(input_path: Path, output_path: Path, voice: str, converter) -> Path:
+    def fake_convert_long_audio(
+        input_path: Path,
+        output_path: Path,
+        voice: str,
+        converter,
+        *,
+        on_progress=None,
+        use_cache: bool = True,
+    ) -> Path:
         call_log.append("convert")
         captured["convert_input_path"] = input_path
         captured["convert_output_path"] = output_path
         captured["convert_voice"] = voice
         captured["convert_converter"] = converter
+        captured["convert_on_progress"] = on_progress
+        captured["convert_use_cache"] = use_cache
+        if on_progress is not None:
+            on_progress("Converting audio...")
         if convert_error is not None:
             raise convert_error
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -289,3 +301,46 @@ def test_final_output_survives_temporary_directory_cleanup(
     assert not tmp_dir.exists()
     assert result.exists()
     assert result.read_bytes() == b"fake dubbed mp4 bytes"
+
+
+def test_dub_video_reports_progress_in_sensible_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    call_log: list[str] = []
+    captured: dict = {}
+    _install_stage_fakes(monkeypatch, call_log=call_log, captured=captured)
+
+    events: list[str] = []
+    output_path = tmp_path / "dubbed.mp4"
+
+    dub_video(
+        "https://youtu.be/dQw4w9WgXcQ",
+        output_path,
+        "voice-1",
+        FakeVoiceConverter(),
+        on_progress=events.append,
+    )
+
+    # The fake convert_long_audio reports its own "Converting audio..."
+    # event through the same callback, between extraction and remuxing.
+    assert events == [
+        "Downloading video...",
+        "Extracting audio...",
+        "Converting audio...",
+        "Remuxing video...",
+    ]
+
+
+def test_dub_video_forwards_use_cache_flag_to_convert_long_audio(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    call_log: list[str] = []
+    captured: dict = {}
+    _install_stage_fakes(monkeypatch, call_log=call_log, captured=captured)
+
+    output_path = tmp_path / "dubbed.mp4"
+    dub_video(
+        "https://youtu.be/dQw4w9WgXcQ", output_path, "voice-1", FakeVoiceConverter(), use_cache=False
+    )
+
+    assert captured["convert_use_cache"] is False
